@@ -1,5 +1,5 @@
 // @file main.cpp
-// @author Luis Laguarda [L.LaguardaSanchez@tudelft.nl]
+// @author Luis Laguarda [lluis.laguarda@gmail.com]
 #include <iostream>
 #include <vector>
 #include <chrono>
