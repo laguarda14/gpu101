@@ -8,7 +8,7 @@
 # - CUDA-capable GPUs
 # - Apple Silicon (Metal backend)
 #
-# For more info, see: 
+# For more info, see:
 #   https://nvidia.github.io/warp/basics.html
 #
 # Author : Luis Laguarda
@@ -18,17 +18,21 @@
 
 import warp as wp
 import numpy as np
+import torch
 import time
+
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="torch.cuda")
 
 # explicitely initialize warp (this compiles kernels for all backends)
 wp.init()
 
 # constants
-M    = 512
-N    = 512
-K    = 512
-TILE = wp.constant(8) # tile size
-TILE_THREADS = wp.constant(64)
+SIZES = [512, 1024, 2048, 4096]
+
+# tiling
+TILE = wp.constant(16) # larger tile means better GPU occupancy and L1/shared-mem reuse
+TILE_THREADS = wp.constant(TILE * TILE) # keep it to TILE * TILE so they stay in sync automatically
 
 # ------------
 # warp kernels
@@ -37,7 +41,7 @@ TILE_THREADS = wp.constant(64)
 '''
 @NOTE: warp translates Python-like kernel functions into CUDA C++ or CPU SIMD code,
        then builds optimized GPU kernels ahead-of-time (doesn't work with jit!).
-       The syntax is python but supports shared memory, thread IDs, synchronization, etc.
+       The syntax is Python but supports shared memory, thread IDs, synchronization, etc.
 '''
 
 # naive matmul kernel (no tiling)
@@ -46,7 +50,7 @@ def matmul_naive( A: wp.array2d(dtype=wp.float32)
                 , B: wp.array2d(dtype=wp.float32)
                 , C: wp.array2d(dtype=wp.float32) ):
 
-   i, j = wp.tid() # global thread ID, considering entire launch grid. No need to manually combine blockIdx with threadIdx like in CUDA
+   i, j = wp.tid() # global thread ID, considering entire launch grid. No need to manually combine blockIdx with threadIdx like raw CUDA
 
    M = A.shape[0]
    N = B.shape[1]
@@ -58,19 +62,19 @@ def matmul_naive( A: wp.array2d(dtype=wp.float32)
          acc += A[i, k] * B[k, j]
       C[i, j] = acc
 
-# tile based matmul kernel
+# tile-based matmul kernel
 @wp.kernel
 def matmul_tiled( A: wp.array2d(dtype=wp.float32)
                 , B: wp.array2d(dtype=wp.float32)
                 , C: wp.array2d(dtype=wp.float32) ):
 
    '''
-   @NOTE: warp allows an explicit return inside a kernel to skip further execution of out-of-bounds threads (unlike CUDA)
+   @NOTE: warp allows an explicit return inside a kernel to skip out-of-bounds threads
    '''
 
-   i, j = wp.tid() # important: if launched tiled, these are now block indices instead of global thread indices
+   i, j = wp.tid() # important: when launched with wp.launch_tiled, i/j are block indices, not global thread indices
 
-   acc = wp.tile_zeros(shape=(TILE, TILE), dtype=wp.float32)  
+   acc = wp.tile_zeros(shape=(TILE, TILE), dtype=wp.float32)
 
    K = A.shape[1]
 
@@ -85,25 +89,13 @@ def matmul_tiled( A: wp.array2d(dtype=wp.float32)
 
    wp.tile_store(C, acc, offset=(i*TILE, j*TILE))
 
-# ------------------------
-# main tests and profiling
-# ------------------------
+# -----------------------------------------------
+# helpers: setup and kernel-only launch functions
+# -----------------------------------------------
 
-'''
-@NOTE: the lightweight CPU-only build omits ScopedProfiler
-       and runtime profiling hooks such profile_start, profile_end, etc.
-'''
+def make_inputs(M, N, K, device):
 
-# profiler
-def benchmark(fn, device, label):
-   start = time.perf_counter()
-   fn(device)
-   wp.synchronize_device(device) # make sure all outstanding work on device has completed
-   end = time.perf_counter()
-   print(f"{label} on {device} took {end - start:.4f} seconds")
-
-# launch naive matmul kernel
-def run_naive(device):
+   # allocate and transfer matrices to device, returns (A, B, C, A_np, B_np)
 
    # input matrices
    r = np.random.default_rng(42)
@@ -111,63 +103,126 @@ def run_naive(device):
    B_np = r.random((K, N), dtype=np.float32)
    C_np = np.zeros((M, N), dtype=np.float32)
 
-   # allocate memory on target device and transfer data from host (numpy arrays) into device
-   # - device="cpu"   : allocate on system RAM, accessible directly by CPU threads
-   # - device="cuda"  : allocate in GPU VRAM and copy the data there
-   # - device="metal" : allocate in Apple GPU memory via Metal buffers
-   # also, wrap memory in a wp.array object so warp kernels can access it efficiently
-   A = wp.array(A_np, device=device)
-   B = wp.array(B_np, device=device)
-   C = wp.array(C_np, device=device)
-
-   # launch kernel
-   wp.launch( kernel = matmul_naive
-            , dim    = (M, N) # important: launch one thread per output element!
-            , inputs = [A, B, C]
-            , device = device )
-
-   '''
-   @NOTE: C.numpy() triggers an implicit device-to-host transfer, 
-          and warp automatically synchronizes before performing that copy.
-          So no need for wp.synchronize_device
-   '''
-   #assert(np.allclose(C.numpy(), A_np@B_np))
-   #return C.numpy()
-
-# launch tiled matmul kernel
-def run_tiled(device):
-
-   # input matrices
-   r = np.random.default_rng(42)
-   A_np = r.random((M, K), dtype=np.float32)
-   B_np = r.random((K, N), dtype=np.float32)
-   C_np = np.zeros((M, N), dtype=np.float32) 
-
     # allocate memory on target device and transfer data from host (numpy arrays) into device
    A = wp.array(A_np, device=device)
    B = wp.array(B_np, device=device)
    C = wp.array(C_np, device=device)
 
-   # launch tiled kernel -> important: use "wp.launch_tiled"
+   return A, B, C, A_np, B_np
+
+def launch_naive(A, B, C, device):
+   wp.launch( kernel = matmul_naive
+            , dim    = (A.shape[0], B.shape[1])
+            , inputs = [A, B, C]
+            , device = device )
+
+def launch_tiled(A, B, C, device):
    wp.launch_tiled( kernel    = matmul_tiled
-                  , dim       = (int(M / TILE), int(N / TILE)) # number of blocks
+                  , dim       = (A.shape[0] // TILE, B.shape[1] // TILE)
                   , inputs    = [A, B, C]
-                  , block_dim = TILE_THREADS # number of threads per block
-                  , device    = device )
+                  , block_dim = TILE_THREADS
+                  , device    = device)
 
-   #assert(np.allclose(C.numpy(), A_np@B_np))
-   #return C.numpy()
+# this calls into vendor-optimized BLAS and shows the ceiling our custom kernel is aiming for
+def launch_cublas(A, B, C, device):
+   A_th = wp.to_torch(A)
+   B_th = wp.to_torch(B)
+   C_th = wp.to_torch(C)
+   torch.matmul(A_th, B_th, out=C_th)
 
-# --------------
-# run benchmarks
-# --------------
+# ----------------------
+# Correctness validation
+# ----------------------
+
+def validate(device, size=512):
+
+   # run both kernels once and compare against numpy reference
+
+   M = N = K = size
+   assert M % 16 == 0 and N % 16 == 0 and K % 16 == 0
+   A, B, C, A_np, B_np = make_inputs(M, N, K, device)
+   ref = A_np @ B_np
+
+   launch_naive(A, B, C, device)
+   wp.synchronize_device(device)
+   assert np.allclose(C.numpy(), ref, atol=1e-4), "naive kernel result mismatch!"
+
+   # reset C
+   C.fill_(0)
+
+   launch_tiled(A, B, C, device)
+   wp.synchronize_device(device)
+   assert np.allclose(C.numpy(), ref, atol=1e-4), "tiled kernel result mismatch!"
+
+   print(f"  both kernels pass correctness check on {device}")
+
+# ---------------------------------
+# benchmarking (kernel-only timing)
+# ---------------------------------
+
+def gflops(M, N, K, elapsed_s): return (2.0 * M * N * K) / (elapsed_s * 1.e9)
+
+def benchmark(launch_fn, device, label, M, N, K, warmup=3, runs=10):
+
+   # kernel only to measure compute performance not PCIe bandwidth
+
+   # sanity-check: matrix dims must be divisible by tile size at startup,
+   # otherwise run_tiled silently produces wrong results (dropped remainder tiles)
+   assert M % 16 == 0 and N % 16 == 0 and K % 16 == 0, \
+      "M, N, K must be divisible by 16 for tiled kernel"
+
+   A, B, C, _, _ = make_inputs(M, N, K, device)
+
+   # warmup — let Warp compile and cache the kernel
+   for _ in range(warmup): launch_fn(A, B, C, device)
+   wp.synchronize_device(device)
+
+   # timed runs
+   times = []
+   for _ in range(runs):
+      start = time.perf_counter()
+      launch_fn(A, B, C, device)
+      wp.synchronize_device(device) # make sure all outstanding work on device has completed
+      times.append(time.perf_counter() - start)
+
+   avg_s  = (sum(times) / len(times))
+   best_s  = min(times)
+   peak_gf = gflops(M, N, K, best_s)
+   print(f"    {label:<22} avg={avg_s*1000.:8.2f}ms  best={best_s*1000.:8.2f}ms  peak={peak_gf:7.1f} GFLOPS")
+
+# ----------
+# entrypoint
+# ----------
 
 if __name__ == "__main__":
 
    print("\nrunning warp matmul benchmarks...")
 
-   devices = ["cpu", "cuda:0"]
+   devices = ["cpu"]
+   if wp.is_cuda_available():
+      devices.append("cuda:0")
+   else:
+      print("(no CUDA device found — running CPU only)\n")
+
    for dev in devices:
       print(f"\n--- device: {dev} ---")
-      benchmark(run_naive, dev, "naive kernel")
-      benchmark(run_tiled, dev, "tiled kernel")
+
+      # correctness check first
+      validate(dev, size=512)
+      print()
+
+      for size in SIZES:
+
+         # skip large sizes on CPU — they take too long with the naive O(n^3) kernel
+         if dev == "cpu" and size > 512:
+               print(f"  [skipping size {size} on CPU — use numpy for large CPU matmul]")
+               continue
+
+         M = N = K = size
+         print(f"  -- {size}x{size} --")
+         benchmark(launch_naive, dev, "naive kernel", M, N, K)
+         benchmark(launch_tiled, dev, "tiled kernel", M, N, K)
+
+         # cuBLAS reference only available on CUDA
+         if dev != "cpu": benchmark(launch_cublas, dev, "cuBLAS (wp.matmul)", M, N, K)
+         print()
