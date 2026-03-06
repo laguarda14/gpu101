@@ -12,62 +12,59 @@ import numpy as np
 import time
 
 # constants
-M = 512
-N = 512
-K = 512
-TILE_SIZE = 16
-TPB = 16
+M = N = K = 1024
+TPB = TILE_SIZE = 32
 
 # ------------
 # cuda kernels
 # ------------
 @cuda.jit
 def matmul(A, B, C):
-    
+
     # 2D thread index (global coordinates)
-    row, col = cuda.grid(2) 
+    row, col = cuda.grid(2)
 
     if row < C.shape[0] and col < C.shape[1]: # bound check
-       value = 0.0
+       value = float32(0.0)
        for k in range(A.shape[1]):  # dot product of A[row, :] and B[:, col]
           value += A[row, k] * B[k, col]
        C[row, col] = value
 
 @cuda.jit
 def matmul_tiled(A, B, C):
-   
+
    # thread index in current block
-   tx = cuda.threadIdx.x 
-   ty = cuda.threadIdx.y 
+   tx = cuda.threadIdx.x
+   ty = cuda.threadIdx.y
 
    # block index
    bx = cuda.blockIdx.x
    by = cuda.blockIdx.y
 
+   # row and column of target element of C
+   row = by * TILE_SIZE + ty
+   col = bx * TILE_SIZE + tx
+
    # allocate shared memory
    sh_A = cuda.shared.array(shape=(TILE_SIZE, TILE_SIZE), dtype=float32)
    sh_B = cuda.shared.array(shape=(TILE_SIZE, TILE_SIZE), dtype=float32)
 
-   # row and column of target element of C
-   row = by * TILE_SIZE + ty
-   col = bx * TILE_SIZE + tx
-   
    # loop through tiles
-   value = 0.
-   for m in range((A.shape[1] + TILE_SIZE - 1) // TILE_SIZE):
+   value = float32(0.0)
+   n_tiles = (K + TILE_SIZE - 1) // TILE_SIZE
+
+   for m in range(n_tiles):
+
+      # coalesced load: threads in a warp read consecutive columns
+      k_A = m * TILE_SIZE + tx
+      k_B = m * TILE_SIZE + ty
 
       # load tiles from A
-      if row < A.shape[0] and m * TILE_SIZE + tx < A.shape[1]:
-         sh_A[ty, tx] = A[row, m * TILE_SIZE + tx]
-      else:
-         sh_A[ty, tx] = 0.0
+      sh_A[ty, tx] = A[row, k_A] if (row < M and k_A < K) else float(0.0)
 
       # load tiles from B
-      if col < B.shape[1] and m * TILE_SIZE + ty < B.shape[0]:
-         sh_B[ty, tx] = B[m * TILE_SIZE + ty, col]
-      else:
-         sh_B[ty, tx] = 0.0
-      
+      sh_B[ty, tx] = B[k_B, col] if (k_B < K and col < N) else float(0.0)
+
       # wait until all threads have loaded their data
       cuda.syncthreads()
 
@@ -78,71 +75,47 @@ def matmul_tiled(A, B, C):
       # wait again before loading new data
       cuda.syncthreads()
 
-   # write 
-   if row < C.shape[0] and col < C.shape[1]:
+   # write
+   if row < M and col < N:
       C[row, col] = value
 
-# ------------------------
-# main tests and profiling
-# ------------------------
+# ------------
+# benchmarking
+# ------------
 
-# profiler
-def benchmark(fn, label):
-   start = time.perf_counter()
+def benchmark(fn, label, repeats=5):
+
    fn()
-   end = time.perf_counter()
-   print(f"{label} on took {end - start:.4f} seconds")
+   times = []
+   for _ in range(repeats):
+      start = time.perf_counter()
+      fn()
+      end = time.perf_counter()
+      times.append(end - start)
+   mean = sum(times) / len(times)
 
-# launch non-tiled matmul kernel
-def run_naive():
+   # TFLOPS: 2*M*N*K FLOPs (multiply-add counts as 2)
+   tflops = (2 * M * N * K) / (mean * 1e12)
+   print(f"{label:35s}  {mean*1000:7.3f} ms  {tflops:.3f} TFLOPS")
 
-   # input matrices
-   r = np.random.default_rng(42)
-   A_np = r.random((M, K), dtype=np.float32)
-   B_np = r.random((K, N), dtype=np.float32)
-   C_np = np.zeros((M, N), dtype=np.float32)
+# ------
+# kernel
+# ------
 
-   # transfer data to device
-   A = cuda.to_device(A_np)
-   B = cuda.to_device(B_np)
-   C = cuda.to_device(C_np)
+# non-tiled kernel
+def run_naive(A, B, C):
+   tpb = (TPB, TPB)
+   bpg = ((M + tpb[0] - 1) // tpb[0],
+          (M + tpb[1] - 1) // tpb[1])
+   matmul[bpg, tpb](A, B, C) # each thread handles one element
+   cuda.synchronize()
 
-   # launch non-tiled kernel
-   th_per_block = (TPB, TPB)
-   bl_per_grid_x = (M + th_per_block[0] - 1) // th_per_block[0]
-   bl_per_grid_y = (M + th_per_block[1] - 1) // th_per_block[1]
-   matmul[(bl_per_grid_x, bl_per_grid_y), th_per_block](A, B, C) # each thread handles one element
-
-   # copy result back
-   #C_np = C.copy_to_host()
-
-   # verify correctness
-   #assert(np.allclose(C_np, A_np@B_np))
-
-# launch tiled kernel
-def run_tiled():
-
-   # input matrices
-   r = np.random.default_rng(42)
-   A_np = r.random((M, K), dtype=np.float32)
-   B_np = r.random((K, N), dtype=np.float32)
-   C_np = np.zeros((M, N), dtype=np.float32)
-
-   # transfer data to device
-   A = cuda.to_device(A_np)
-   B = cuda.to_device(B_np)
-   C = cuda.to_device(C_np)
-
-   # launch tiled kernel
-   bl_per_grid_x = (N + TILE_SIZE - 1) // TILE_SIZE
-   bl_per_grid_y = (M + TILE_SIZE - 1) // TILE_SIZE
-   matmul_tiled[(bl_per_grid_x, bl_per_grid_y), (TILE_SIZE, TILE_SIZE)](A, B, C) # block size = tile width
-
-   # copy result back
-   #C_np = C.copy_to_host()
-    
-   # verify correctness
-   #assert(np.allclose(C_np, A_np@B_np))
+def run_tiled(A, B, C):
+   tpb = (TILE_SIZE, TILE_SIZE)
+   bpg = ((N + TILE_SIZE - 1) // TILE_SIZE,
+          (M + TILE_SIZE - 1) // TILE_SIZE)
+   matmul_tiled[bpg, tpb](A, B, C) # block size = tile width
+   cuda.synchronize()
 
 # -------------
 # run benchmark
@@ -150,5 +123,27 @@ def run_tiled():
 
 if __name__ == "__main__":
 
-   benchmark(run_naive, 'naive matmul')
-   benchmark(run_tiled, 'tiled matmul')
+   rng = np.random.default_rng(42)
+   A_np = rng.random((M, K), dtype=np.float32)
+   B_np = rng.random((K, N), dtype=np.float32)
+   C_np = np.zeros((M, N), dtype=np.float32)
+
+   # warmup / JIT compile
+   A = cuda.to_device(A_np)
+   B = cuda.to_device(B_np)
+   C = cuda.to_device(C_np)
+   for _ in range(3):
+      run_naive(A, B, C)
+      run_tiled(A, B, C)
+
+   print(f"\nMatrix size: {M}x{K} @ {K}x{N}   Tile: {TILE_SIZE}x{TILE_SIZE}\n")
+   benchmark(lambda: run_naive(A, B, C),  "naive (kernel only)")
+   benchmark(lambda: run_tiled(A, B, C),  "tiled (kernel only)")
+
+   # Correctness check
+   C_naive = cuda.to_device(np.zeros_like(C_np))
+   C_tiled = cuda.to_device(np.zeros_like(C_np))
+   run_naive(A, B, C_naive)
+   run_tiled(A, B, C_tiled)
+   assert np.allclose(C_naive.copy_to_host(), C_tiled.copy_to_host(), atol=1e-3), "Results don't match!"
+   print("\n Results match")
