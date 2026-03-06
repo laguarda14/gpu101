@@ -83,7 +83,7 @@ def matmul_tiled(A, B, C):
 # benchmarking
 # ------------
 
-def benchmark(fn, label, repeats=5):
+def benchmark(fn, label, repeats=10):
 
    fn()
    times = []
@@ -140,10 +140,10 @@ if __name__ == "__main__":
    benchmark(lambda: run_naive(A, B, C),  "naive (kernel only)")
    benchmark(lambda: run_tiled(A, B, C),  "tiled (kernel only)")
 
-   # Correctness check
+   # correctness check
    C_naive = cuda.to_device(np.zeros_like(C_np))
    C_tiled = cuda.to_device(np.zeros_like(C_np))
    run_naive(A, B, C_naive)
    run_tiled(A, B, C_tiled)
    assert np.allclose(C_naive.copy_to_host(), C_tiled.copy_to_host(), atol=1e-3), "Results don't match!"
-   print("\n Results match")
+   print("\nResults match")
