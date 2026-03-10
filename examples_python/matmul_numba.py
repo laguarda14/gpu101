@@ -21,8 +21,8 @@ TPB = TILE_SIZE = 32
 @cuda.jit
 def matmul(A, B, C):
 
-    # 2D thread index (global coordinates)
-    row, col = cuda.grid(2)
+    # 2D thread index (global coordinates) -> col first because numpy arrays are row-major & numba preserves memory layout
+    col, row = cuda.grid(2)
 
     if row < C.shape[0] and col < C.shape[1]: # bound check
        value = float32(0.0)
@@ -42,8 +42,8 @@ def matmul_tiled(A, B, C):
    by = cuda.blockIdx.y
 
    # row and column of target element of C
-   row = by * TILE_SIZE + ty
    col = bx * TILE_SIZE + tx
+   row = by * TILE_SIZE + ty
 
    # allocate shared memory
    sh_A = cuda.shared.array(shape=(TILE_SIZE, TILE_SIZE), dtype=float32)
