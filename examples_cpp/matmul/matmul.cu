@@ -1,6 +1,7 @@
+// @file matmul.cu
+// @author Luis Laguarda [lluis.laguarda@gmail.com]
 #include <iostream>
 #include <vector>
-#include <cassert>
 
 #define TILE_WIDTH 32
 
@@ -15,31 +16,30 @@
 // device functions
 // ----------------
 
-__global__ void matmul_kernel(float* A, float* B, float* C, int N1, int N2, int N3)
+__global__ void naive_matmul_kernel(float* A, float* B, float* C, int N1, int N2, int N3)
 {
-   int j = blockDim.y*blockIdx.y + threadIdx.y; // row
-   int i = blockDim.x*blockIdx.x + threadIdx.x; // column
+   int i = blockDim.y*blockIdx.y + threadIdx.y; // row
+   int j = blockDim.x*blockIdx.x + threadIdx.x; // column
 
    if (i < N1 && j < N3) // bound check
    {
       // value at C[i,j]
-      float value = 0;
+      float value = 0.0f;
       for (int k = 0; k < N2; k++)
       {
          value += A[i*N2+k] * B[k*N3+j];
       }
-
       C[i*N3+j] = value;
    }
 }
 
-/* we load each element once per tile, not once per thread. Therefore, global memory traffic is reduced by a factor TILE_WIDTH*/
-
+/* each element is loaded once per tile rather than once per thread,
+   reducing global memory traffic by a factor TILE_WIDTH */
 __global__ void tiled_matmul_kernel(float* A, float* B, float* C, int N1, int N2, int N3)
 {
    // ensure that TILE_WIDTH = BLOCK_SIZE
-   assert(TILE_WIDTH == blockDim.x);
-   assert(TILE_WIDTH == blockDim.y);
+   // assert(TILE_WIDTH == blockDim.x);
+   // assert(TILE_WIDTH == blockDim.y);
 
    int tx = threadIdx.x;
    int ty = threadIdx.y;
@@ -51,21 +51,21 @@ __global__ void tiled_matmul_kernel(float* A, float* B, float* C, int N1, int N2
    __shared__ float sh_B[TILE_WIDTH][TILE_WIDTH];
 
    // loop through tiles
-   float value = 0;
-   for (int phase = 0; phase < ceil((float)N2/TILE_WIDTH); phase++)
+   float value = 0.0f;
+   int num_phases = (N2 + TILE_WIDTH - 1) / TILE_WIDTH; // integer ceiling, no float cast
+
+   for (int phase = 0; phase < num_phases; phase++)
    {
-      // load tiles from matrix A into shared memory
-      // these memory addresses are contiguouss -> coalesced global memory access!
+      // coalesced load of A tile
       if ((i < N1) && ((phase*TILE_WIDTH+tx) < N2)) {
-         sh_A[ty][tx] = A[(i)*N2 + phase*TILE_WIDTH+tx];
+         sh_A[ty][tx] = A[i*N2 + phase*TILE_WIDTH + tx];
       } else {
          sh_A[ty][tx] = 0.0f;
       }
 
-      // load tiles from matrix B into shared memory
-      // these memory addresses are also contiguouss -> coalesced global memory access!
+      // coalesced load of B tile
       if (((phase*TILE_WIDTH + ty) < N2) && (j < N3)) {
-         sh_B[ty][tx] = B[(phase*TILE_WIDTH + ty)*N3+j];
+         sh_B[ty][tx] = B[(phase*TILE_WIDTH + ty)*N3 + j];
       } else {
          sh_B[ty][tx] = 0.0f;
       }
@@ -78,9 +78,8 @@ __global__ void tiled_matmul_kernel(float* A, float* B, float* C, int N1, int N2
       __syncthreads();
    }
 
-   if (i < N1 && j < N3) // bound check
-   {
-      C[i*N3+j] = value;
+   if (i < N1 && j < N3) { // bound check
+      C[i*N3 + j] = value;
    }
 }
 
@@ -88,8 +87,8 @@ __global__ void tiled_matmul_kernel(float* A, float* B, float* C, int N1, int N2
 // Host functions
 // --------------
 
-void printDeviceInfo(int device_id = 0) {
-
+void printDeviceInfo(int device_id = 0)
+{
    cudaDeviceProp dev_prop;
    cudaError_t err = cudaGetDeviceProperties(&dev_prop, device_id);
    CUDA_CHECK(err);
@@ -99,92 +98,87 @@ void printDeviceInfo(int device_id = 0) {
 
 }
 
-void matmul(std::vector<float>& A, std::vector<float>& B, std::vector<float>& C, int N1, int N2, int N3)
+// allocates device memory, copies A and B to device, returns pointers
+// caller is responsible for freeing d_A, d_B, d_C.
+static void device_alloc_and_copy(const std::vector<float>& A, const std::vector<float>& B, float** d_A, float** d_B, float** d_C, int N1, int N2, int N3)
 {
-   // print GPU info
-   // printDeviceInfo();
+   cudaError_t err;
 
-   // device array pointers
-   float* d_A;
-   float* d_B;
-   float* d_C;
+   err = cudaMalloc((void**)d_A, N1 * N2 * sizeof(float)); CUDA_CHECK(err);
+   err = cudaMalloc((void**)d_B, N2 * N3 * sizeof(float)); CUDA_CHECK(err);
+   err = cudaMalloc((void**)d_C, N1 * N3 * sizeof(float)); CUDA_CHECK(err);
 
-   // device memory allocation
-   cudaError_t err_A = cudaMalloc((void**)&d_A, N1*N2*sizeof(float));
-   CUDA_CHECK(err_A);
-
-   cudaError_t err_B = cudaMalloc((void**)&d_B, N2*N3*sizeof(float));
-   CUDA_CHECK(err_B);
-
-   cudaError_t err_C = cudaMalloc((void**)&d_C, N1*N3*sizeof(float));
-   CUDA_CHECK(err_C);
-
-   // copy A and B to device memory
-   cudaError_t err_A_ = cudaMemcpy(d_A, &A[0], N1*N2*sizeof(float), cudaMemcpyHostToDevice);
-   CUDA_CHECK(err_A_);
-
-   cudaError_t err_B_ = cudaMemcpy(d_B, &B[0], N2*N3*sizeof(float), cudaMemcpyHostToDevice);
-   CUDA_CHECK(err_B_);
-
-   // kernel execution
-   dim3 dim_block(32, 32, 1);
-   dim3 dim_grid(ceil(N3/32.0), ceil(N1/32.0), 1);
-   matmul_kernel<<<dim_grid, dim_block>>>(d_A, d_B, d_C, N1, N2, N3);
-   cudaError_t err = cudaGetLastError();
-   CUDA_CHECK(err);
-
-   // copy results back to host memory
-   cudaError_t err_C_ = cudaMemcpy(&C[0], d_C, N1*N3*sizeof(float), cudaMemcpyDeviceToHost);
-   CUDA_CHECK(err_C_);
-
-   // free device memory
-   cudaFree(d_A);
-   cudaFree(d_B);
-   cudaFree(d_C);
-
+   err = cudaMemcpy(*d_A, A.data(), N1 * N2 * sizeof(float), cudaMemcpyHostToDevice); CUDA_CHECK(err);
+   err = cudaMemcpy(*d_B, B.data(), N2 * N3 * sizeof(float), cudaMemcpyHostToDevice); CUDA_CHECK(err);
 }
 
-void tiled_matmul(std::vector<float>& A, std::vector<float>& B, std::vector<float>& C, int N1, int N2, int N3)
+// copy C to host and free pointers
+static void device_copy_and_free(std::vector<float>& C, float* d_A, float* d_B, float* d_C, int N1, int N3)
 {
-   // print GPU info
-   // printDeviceInfo();
-
-   // device array pointers
-   float* d_A;
-   float* d_B;
-   float* d_C;
-
-   // device memory allocation
-   cudaError_t err_A = cudaMalloc((void**)&d_A, N1*N2*sizeof(float));
-   CUDA_CHECK(err_A);
-
-   cudaError_t err_B = cudaMalloc((void**)&d_B, N2*N3*sizeof(float));
-   CUDA_CHECK(err_B);
-
-   cudaError_t err_C = cudaMalloc((void**)&d_C, N1*N3*sizeof(float));
-   CUDA_CHECK(err_C);
-
-   // copy A and B to device memory
-   cudaError_t err_A_ = cudaMemcpy(d_A, &A[0], N1*N2*sizeof(float), cudaMemcpyHostToDevice);
-   CUDA_CHECK(err_A_);
-
-   cudaError_t err_B_ = cudaMemcpy(d_B, &B[0], N2*N3*sizeof(float), cudaMemcpyHostToDevice);
-   CUDA_CHECK(err_B_);
-
-   // kernel execution
-   dim3 dim_block(TILE_WIDTH, TILE_WIDTH, 1);
-   dim3 dim_grid(ceil(N3/(float)(TILE_WIDTH)), ceil(N1/(float)(TILE_WIDTH)), 1);
-   tiled_matmul_kernel<<<dim_grid, dim_block>>>(d_A, d_B, d_C, N1, N2, N3);
-   cudaError_t err = cudaGetLastError();
-   CUDA_CHECK(err);
-
-   // copy results back to host memory
-   cudaError_t err_C_ = cudaMemcpy(&C[0], d_C, N1*N3*sizeof(float), cudaMemcpyDeviceToHost);
-   CUDA_CHECK(err_C_);
-
-   // free device memory
+   cudaError_t err;
+   err = cudaMemcpy(C.data(), d_C, N1 * N3 * sizeof(float), cudaMemcpyDeviceToHost); CUDA_CHECK(err);
    cudaFree(d_A);
    cudaFree(d_B);
    cudaFree(d_C);
+}
 
+// launch naive matmul, returns kernel-only execution time in milliseconds
+float naive_matmul(std::vector<float>& A, std::vector<float>& B, std::vector<float>& C, int N1, int N2, int N3)
+{
+   float *d_A, *d_B, *d_C;
+   device_alloc_and_copy(A, B, &d_A, &d_B, &d_C, N1, N2, N3);
+
+   dim3 dim_block(32, 32, 1);
+   dim3 dim_grid((N3 + 31) / 32, (N1 + 31) / 32, 1); // integer ceiling
+
+   // measure kernel time with CUDA events (device-side, excludes transfers)
+   cudaEvent_t start, stop;
+   cudaEventCreate(&start);
+   cudaEventCreate(&stop);
+
+   // kernel execution
+   cudaEventRecord(start);
+   naive_matmul_kernel<<<dim_grid, dim_block>>>(d_A, d_B, d_C, N1, N2, N3);
+   cudaEventRecord(stop);
+   cudaEventSynchronize(stop); // blocks host until stop is reached
+
+   CUDA_CHECK(cudaGetLastError());
+
+   float kernel_ms = 0.0f;
+   cudaEventElapsedTime(&kernel_ms, start, stop);
+   cudaEventDestroy(start);
+   cudaEventDestroy(stop);
+
+   // copy results back to host
+   device_copy_and_free(C, d_A, d_B, d_C, N1, N3);
+   return kernel_ms;
+}
+
+// launch tiled matmul, returns kernel-only execution time in milliseconds
+float tiled_matmul(std::vector<float>& A, std::vector<float>& B, std::vector<float>& C, int N1, int N2, int N3)
+{
+   float *d_A, *d_B, *d_C;
+   device_alloc_and_copy(A, B, &d_A, &d_B, &d_C, N1, N2, N3);
+
+   dim3 dim_block(TILE_WIDTH, TILE_WIDTH, 1);
+   dim3 dim_grid((N3 + TILE_WIDTH - 1) / TILE_WIDTH, (N1 + TILE_WIDTH - 1) / TILE_WIDTH, 1);
+
+   cudaEvent_t start, stop;
+   cudaEventCreate(&start);
+   cudaEventCreate(&stop);
+
+   cudaEventRecord(start);
+   tiled_matmul_kernel<<<dim_grid, dim_block>>>(d_A, d_B, d_C, N1, N2, N3);
+   cudaEventRecord(stop);
+   cudaEventSynchronize(stop); // blocks host until stop is reached
+
+   CUDA_CHECK(cudaGetLastError());
+
+   float kernel_ms = 0.0f;
+   cudaEventElapsedTime(&kernel_ms, start, stop);
+   cudaEventDestroy(start);
+   cudaEventDestroy(stop);
+
+   device_copy_and_free(C, d_A, d_B, d_C, N1, N3);
+   return kernel_ms;
 }
